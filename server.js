@@ -1,0 +1,535 @@
+// Orion — backend feed aggregator
+// Scarica gli RSS delle testate, li categorizza (macro/azioni/crypto/forex/obbligazioni/materie)
+// e li serve come JSON al frontend statico. Pensato per girare su Render, stesso pattern di ob-proxy.
+
+const express = require('express');
+const cors = require('cors');
+const Parser = require('rss-parser');
+const cheerio = require('cheerio');
+const webpush = require('web-push');
+
+const app = express();
+const parser = new Parser({ timeout: 10000 });
+
+app.use(cors()); // in produzione puoi restringere all'origine del tuo sito statico
+app.use(express.json());
+
+// ---------------------------------------------------------------------------
+// 0. NOTIFICHE PUSH — servono le chiavi VAPID come variabili d'ambiente su
+// Render (Settings → Environment): VAPID_PUBLIC_KEY e VAPID_PRIVATE_KEY.
+// Senza queste due, le notifiche restano semplicemente disattivate — il resto
+// dell'app funziona lo stesso.
+// ---------------------------------------------------------------------------
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+const pushEnabled = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
+
+if (pushEnabled) {
+  webpush.setVapidDetails('mailto:orion-app@example.com', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} else {
+  console.warn('[orion] VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY non impostate: notifiche push disattivate.');
+}
+
+// Iscrizioni salvate in memoria (un dispositivo = un abbonamento). Come per la
+// cache dei feed, si svuotano se Render riavvia il servizio — per qualcosa di
+// permanente andrebbe salvato su un database, ma per iniziare va bene così.
+let pushSubscriptions = [];
+let notifiedLinks = new Set(); // per non notificare due volte lo stesso articolo
+let hasRunNotifyCheck = false; // false finché non abbiamo fatto il primo giro "silenzioso" dopo l'avvio
+let dailyNotifyCount = 0;
+let dailyNotifyResetDate = new Date().toDateString();
+const MAX_NOTIFICATIONS_PER_DAY = 5;
+
+// Parole chiave per capire se una notizia è "importante" o un evento speciale
+// (eventi da banca centrale, mosse improvvise dei mercati). Semplice ma gratis
+// e veloce — nessuna chiamata IA aggiuntiva per questo controllo.
+const IMPORTANCE_KEYWORDS = [
+  'crolla', 'crollo', 'crolli', 'precipita', 'affonda', 'record', 'shock',
+  'storico', 'storica', 'taglia i tassi', 'alza i tassi', 'rialzo dei tassi',
+  'taglio dei tassi', 'allarme', 'panico', 'balzo', 'impenna', 'sospende le contrattazioni',
+  'fallimento', 'bancarotta', 'crash', 'plunge', 'plunges', 'surges', 'surge',
+  'record high', 'all-time high', 'emergency', 'slashes rates', 'hikes rates',
+  'halts trading', 'bankruptcy', 'default',
+];
+
+function isImportant(title) {
+  const t = title.toLowerCase();
+  return IMPORTANCE_KEYWORDS.some((k) => t.includes(k));
+}
+
+// ---------------------------------------------------------------------------
+// 1. FONTI — aggiungi/rimuovi feed qui. Tutti RSS pubblici, nessuna chiave richiesta.
+//
+// Ogni fonte ha già la sua categoria "di nascita" (forceCategory): niente più
+// indovinelli via parole chiave per queste, quindi niente più "tutto in macro".
+// Le parole chiave restano solo come ripiego per le 2-3 fonti davvero generaliste
+// in fondo alla lista (Reuters, CNBC, Yahoo Finance), che non sono divise per argomento.
+// ---------------------------------------------------------------------------
+const FEEDS = [
+  // --- CRYPTO: confermate funzionanti ---
+  { url: 'https://www.coindesk.com/arc/outboundfeeds/rss/', source: 'CoinDesk', forceCategory: 'crypto' },
+  { url: 'https://cointelegraph.com/rss', source: 'CoinTelegraph', forceCategory: 'crypto' },
+
+  // --- FOREX: FXStreet e DailyFX bloccano le richieste automatiche (403),
+  // proviamo ForexLive (blog, di solito il classico feed WordPress funziona) ---
+  { url: 'https://www.forexlive.com/feed', source: 'ForexLive', forceCategory: 'forex' },
+
+  // --- MATERIE PRIME: confermata funzionante ---
+  { url: 'https://oilprice.com/rss/main', source: 'OilPrice.com', forceCategory: 'materie' },
+
+  // --- AZIONI: confermata funzionante ---
+  { url: 'https://www.marketwatch.com/rss/topstories', source: 'MarketWatch', forceCategory: 'azioni' },
+
+  // --- OBBLIGAZIONI: per ora nessuna fonte dedicata affidabile trovata — resta
+  // vuota finché non ne troviamo una che funzioni davvero (vedi messaggio) ---
+
+  // --- MACRO: confermate funzionanti ---
+  { url: 'https://www.investing.com/rss/news_301.rss', source: 'Investing.com', forceCategory: 'macro' },
+  { url: 'https://www.ansa.it/sito/notizie/economia/economia_rss.xml', source: 'ANSA Economia', forceCategory: 'macro' },
+  { url: 'https://www.ilsole24ore.com/rss/finanza.xml', source: 'Il Sole 24 Ore', forceCategory: 'macro' },
+
+  // --- fonti generaliste: qui NON conosciamo l'argomento in anticipo, quindi
+  // resta il matching per parole chiave (bilingue) come ripiego. Sono anche le
+  // uniche a poter alimentare "obbligazioni" per ora, quando capita un titolo
+  // che parla di BTP/bond/yield ---
+  { url: 'https://www.cnbc.com/id/100003114/device/rss/rss.html', source: 'CNBC Markets' },
+  { url: 'https://finance.yahoo.com/news/rssindex', source: 'Yahoo Finance' },
+];
+// Reuters rimosso: feeds.reuters.com non esiste più (dominio non risolve).
+// FXStreet, DailyFX, Milano Finanza (sezioni borsa/obbligazioni) e quasi tutti
+// gli URL "per categoria" di Investing.com rimossi: davano 404/403 nel test reale.
+
+// ---------------------------------------------------------------------------
+// 2. CATEGORIZZAZIONE — usata solo per le fonti generaliste (senza forceCategory).
+// Parole chiave sia in italiano che in inglese: molte testate (Reuters, CNBC,
+// MarketWatch...) scrivono i titoli in inglese, e prima riconoscevamo solo
+// l'italiano — per questo quasi tutto finiva nel "macro" di default.
+// ---------------------------------------------------------------------------
+const CATEGORY_KEYWORDS = {
+  crypto: ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'blockchain', 'token', 'defi', 'stablecoin', 'altcoin', 'solana', 'binance'],
+  forex: ['dollaro', 'euro', 'yen', 'sterlina', 'cambio', 'forex', 'usd/', 'eur/', 'valuta', 'currency', 'exchange rate', 'dollar', 'yuan', 'pound', 'fx '],
+  obbligazioni: ['btp', 'bond', 'obbligazion', 'spread', 'rendimento', 'treasury', 'bund', 'yield', 'gilt', 'note auction'],
+  materie: ['petrolio', 'brent', 'oro', 'gas naturale', 'materie prime', 'oil', 'gold', 'commodity', 'commodities', 'opec', 'wti', 'natural gas', 'copper', 'silver'],
+  azioni: ['borsa', 'piazza affari', 'ftse', 'nasdaq', 'wall street', 'azioni', 'trimestrale', 'utili', 'ipo', 'stock', 'stocks', 'shares', 'earnings', 's&p', 'dow jones', 'equities', 'nyse'],
+  macro: ['bce', 'fed', 'inflazione', 'pil', 'tassi', 'disoccupazione', 'occupazione', 'banca centrale', 'inflation', 'gdp', 'interest rate', 'unemployment', 'central bank', 'ecb', 'recession', 'jobs report'],
+};
+
+function categorize(title) {
+  const t = title.toLowerCase();
+  for (const [cat, keywords] of Object.entries(CATEGORY_KEYWORDS)) {
+    if (keywords.some((k) => t.includes(k))) return cat;
+  }
+  return 'macro'; // fallback di default, quando davvero non riconosce nulla
+}
+
+const CATEGORY_LABELS = {
+  macro: 'Macro', azioni: 'Azioni', crypto: 'Crypto',
+  forex: 'Forex', obbligazioni: 'Obbligazioni', materie: 'Materie prime',
+};
+
+// ---------------------------------------------------------------------------
+// 2b. RIASSUNTO IA PER CATEGORIA — usa Groq (stesso provider di Clark) per
+// scrivere un piccolo paragrafo che riassume le notizie del giorno per ogni
+// categoria. Serve la variabile d'ambiente GROQ_API_KEY su Render (Settings →
+// Environment). Se manca, l'app funziona lo stesso: i riassunti restano vuoti.
+// ---------------------------------------------------------------------------
+const GROQ_MODEL = 'llama-3.1-8b-instant'; // veloce ed economico, va benissimo per un riassunto breve
+
+// Controllo di sicurezza sul testo che torna da Groq: se sembra rotto,
+// vuoto, tagliato a metà o sospetto, meglio non mostrare nulla (o un testo
+// accorciato ma completo) che mostrare un riassunto rovinato o interrotto
+// a metà frase.
+function sanitizeSummary(text, label) {
+  if (!text) return null;
+
+  // ripulisce eventuale markdown residuo (anche se il prompt lo vieta esplicitamente)
+  let clean = text.replace(/[*_#`]/g, '').trim();
+
+  // troppo corto per essere un vero riassunto (es. Groq ha risposto con un errore o "Mi dispiace...")
+  if (clean.length < 25) {
+    console.warn(`[orion] riassunto scartato per ${label}: troppo corto ("${clean}")`);
+    return null;
+  }
+
+  // frasi tipiche di un modello che si scusa/rifiuta invece di riassumere
+  const redFlags = ['mi dispiace', 'non posso', 'as an ai', 'i cannot', "i'm sorry"];
+  if (redFlags.some((f) => clean.toLowerCase().startsWith(f))) {
+    console.warn(`[orion] riassunto scartato per ${label}: sembra un rifiuto/scusa del modello`);
+    return null;
+  }
+
+  // troppo lungo: qualcosa è andato storto col limite di token, tagliamo per sicurezza
+  // (il taglio vero e proprio, a fine frase, avviene comunque nel controllo qui sotto)
+  if (clean.length > 1600) clean = clean.slice(0, 1600);
+
+  // testo tagliato a metà: se non finisce con un punto/esclamativo/domanda,
+  // Groq è stato interrotto a metà frase (di solito per il limite di token).
+  // Meglio accorciare all'ultima frase completa che mostrare un troncamento.
+  const endsProperly = /[.!?…]["')]?$/.test(clean);
+  if (!endsProperly) {
+    const lastSentenceEnd = Math.max(clean.lastIndexOf('.'), clean.lastIndexOf('!'), clean.lastIndexOf('?'));
+    if (lastSentenceEnd + 1 >= 25) {
+      // c'è almeno una frase completa abbastanza sostanziosa: teniamo quella
+      console.warn(`[orion] riassunto per ${label} tagliato a metà, accorciato all'ultima frase completa`);
+      clean = clean.slice(0, lastSentenceEnd + 1).trim();
+    } else {
+      // troppo poco testo completo per essere utile: meglio scartare tutto
+      console.warn(`[orion] riassunto scartato per ${label}: tagliato a metà senza una frase completa recuperabile`);
+      return null;
+    }
+  }
+
+  return clean;
+}
+
+async function summarizeCategory(categoryKey, articles) {
+  if (!articles.length) return null;
+
+  const bullets = articles
+    .slice(0, 15)
+    .map((a) => `- ${a.title}${a.summary ? ': ' + a.summary : ''}`)
+    .join('\n');
+
+  const prompt = `Sei l'assistente editoriale di un'app di notizie finanziarie chiamata Orion.
+Qui sotto trovi i titoli (e riassunti) delle notizie di oggi nella categoria "${CATEGORY_LABELS[categoryKey]}".
+Scrivi un riassunto dettagliato e concreto della giornata in questa categoria, in italiano, di circa
+8-12 frasi (anche in 2-3 brevi paragrafi se aiuta la lettura). Copri più temi distinti se ci sono
+(non fermarti alla prima notizia), riporta numeri/dati/nomi citati nei testi, e dai un minimo di
+contesto su perché ogni cosa è rilevante. Tono neutro e informativo, come un notiziario approfondito.
+Non inventare numeri o fatti che non sono nel testo qui sotto. Non usare markdown.
+
+Notizie:
+${bullets}`;
+
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.3,
+        max_tokens: 650,
+      }),
+    });
+    if (!res.ok) throw new Error(`Groq status ${res.status}`);
+    const data = await res.json();
+    const raw = data.choices?.[0]?.message?.content?.trim() || '';
+    return sanitizeSummary(raw, categoryKey);
+  } catch (err) {
+    console.error(`[orion] errore riassunto IA per ${categoryKey}:`, err.message);
+    return null;
+  }
+}
+
+let categorySummaries = {};
+
+// ---------------------------------------------------------------------------
+// 2c. RIASSUNTO IA PER IL SINGOLO ARTICOLO — a differenza di quello per
+// categoria, questo viene generato al momento (quando l'utente apre il
+// pannello dell'articolo in Orion), non per tutti gli articoli ad ogni
+// aggiornamento — altrimenti sarebbero centinaia di chiamate a Groq ogni
+// 20 minuti per articoli che magari nessuno apre mai.
+//
+// IMPORTANTE: il feed RSS fornisce solo titolo + un breve estratto, mai il
+// testo completo dell'articolo. Questo riassunto quindi rende più chiaro e
+// scorrevole quello che già sappiamo (titolo+estratto) — non "legge" parti
+// dell'articolo che non sono nell'anteprima RSS.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 2c. RIASSUNTO IA PER IL SINGOLO ARTICOLO — generato al momento (quando
+// l'utente apre il pannello in Orion), non per tutti gli articoli ad ogni
+// aggiornamento — altrimenti sarebbero centinaia di chiamate a Groq ogni
+// 20 minuti per articoli che magari nessuno apre mai.
+//
+// Prima prova a scaricare ed estrarre il testo vero dell'articolo dal sito
+// della testata, per fare un riassunto più corposo e con più contenuto reale.
+// Se il sito blocca lo scraping, ha paywall, o l'estrazione fallisce, torna
+// comunque un riassunto breve basato solo su titolo+estratto RSS — non lascia
+// mai l'utente senza nulla.
+// ---------------------------------------------------------------------------
+async function fetchArticleText(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; OrionNewsBot/1.0)' },
+    });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const html = await res.text();
+    const $ = cheerio.load(html);
+    $('script, style, nav, header, footer, aside, form, iframe, noscript').remove();
+
+    // proviamo prima dentro <article>, se c'è (la maggior parte dei siti di news la usa)
+    let container = $('article');
+    if (!container.length) container = $('body');
+
+    const paragraphs = container
+      .find('p')
+      .map((_, el) => $(el).text().trim())
+      .get()
+      .filter((t) => t.length > 40); // scarta didascalie/frammenti troppo corti
+
+    const text = paragraphs.join('\n').slice(0, 6000); // limite ragionevole per il prompt
+    return text.length > 200 ? text : null; // troppo poco estratto: non serve a niente
+  } catch (err) {
+    console.warn(`[orion] impossibile estrarre il testo di ${url}:`, err.message);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function summarizeArticle(title, snippet, link) {
+  const fullText = link ? await fetchArticleText(link) : null;
+
+  const prompt = fullText
+    ? `Sei l'assistente editoriale dell'app di notizie finanziarie Orion.
+Qui sotto trovi il testo estratto di un articolo vero. Scrivi in italiano un riassunto
+completo e concreto (5-8 frasi, anche in 2 brevi paragrafi se utile), che riporti i
+punti chiave, i numeri/dati citati e il contesto principale. Resta fedele al testo:
+non inventare fatti, numeri o dichiarazioni che non ci sono. Non citare frasi intere
+tra virgolette, riformula sempre con parole tue. Non usare markdown.
+
+Titolo: ${title}
+
+Testo dell'articolo:
+${fullText}`
+    : `Sei l'assistente editoriale dell'app di notizie finanziarie Orion.
+Hai solo il titolo e un breve estratto di un articolo (non il testo completo, non sono
+riuscito a scaricarlo dal sito). Riscrivi in italiano, in 2-3 frasi chiare, quello che si
+capisce dal titolo e dall'estratto — senza inventare dettagli che non ci sono. Tono
+neutro e informativo. Non usare markdown.
+
+Titolo: ${title}
+Estratto: ${snippet || '(nessun estratto disponibile, basati solo sul titolo)'}`;
+
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      max_tokens: fullText ? 500 : 160,
+    }),
+  });
+  if (!res.ok) throw new Error(`Groq status ${res.status}`);
+  const data = await res.json();
+  const raw = data.choices?.[0]?.message?.content?.trim() || '';
+  return { text: sanitizeSummary(raw, `articolo "${title.slice(0, 40)}..."`), fromFullText: !!fullText };
+}
+
+app.post('/api/article-summary', async (req, res) => {
+  if (!process.env.GROQ_API_KEY) {
+    return res.status(503).json({ error: 'GROQ_API_KEY non configurata sul server' });
+  }
+  const { title, summary, link } = req.body || {};
+  if (!title) {
+    return res.status(400).json({ error: 'manca il titolo dell\'articolo' });
+  }
+  try {
+    const { text, fromFullText } = await summarizeArticle(title, summary || '', link);
+    res.json({ summary: text, fromFullText }); // "summary: null" se Groq ha risposto male: il frontend userà l'estratto grezzo
+  } catch (err) {
+    console.error('[orion] errore riassunto articolo:', err.message);
+    res.status(502).json({ error: 'riassunto non disponibile', summary: null });
+  }
+});
+
+async function generateSummaries() {
+  if (!process.env.GROQ_API_KEY) {
+    console.warn('[orion] GROQ_API_KEY non impostata: salto i riassunti IA.');
+    return;
+  }
+  const newSummaries = {};
+  for (const cat of Object.keys(CATEGORY_LABELS)) {
+    const articles = feedCache.filter((a) => a.category === cat);
+    newSummaries[cat] = await summarizeCategory(cat, articles);
+  }
+  categorySummaries = newSummaries;
+  console.log('[orion] riassunti IA aggiornati per', Object.keys(newSummaries).filter(k => newSummaries[k]).length, 'categorie');
+}
+
+// ---------------------------------------------------------------------------
+// 3. CACHE IN MEMORIA — aggiornata a intervalli, letta dall'endpoint.
+// Per qualcosa di più robusto (sopravvive ai riavvii del server free tier di Render)
+// puoi sostituire questo array con una tabella su Supabase o un file su disco.
+// ---------------------------------------------------------------------------
+let feedCache = [];
+let lastUpdated = null;
+let lastCounts = {};
+
+async function fetchAndUpdate() {
+  const results = [];
+  const countBySource = {};
+
+  for (const feed of FEEDS) {
+    try {
+      const parsed = await parser.parseURL(feed.url);
+      let count = 0;
+      for (const item of parsed.items.slice(0, 15)) {
+        results.push({
+          title: item.title?.trim() || '',
+          link: item.link || '',
+          source: feed.source,
+          publishedAt: item.isoDate || item.pubDate || new Date().toISOString(),
+          summary: (item.contentSnippet || '').slice(0, 220),
+          category: feed.forceCategory || categorize(item.title || ''),
+        });
+        count++;
+      }
+      countBySource[`${feed.source} (${feed.forceCategory || 'auto'})`] = count;
+    } catch (err) {
+      console.error(`[orion] errore feed ${feed.source} (${feed.url}):`, err.message);
+      countBySource[`${feed.source} (${feed.forceCategory || 'auto'})`] = 'ERRORE: ' + err.message;
+      // un feed che fallisce non deve bloccare gli altri
+    }
+  }
+
+  console.log('[orion] articoli per fonte:', countBySource);
+  lastCounts = countBySource;
+
+  // dedup per link + ordina dal più recente
+  const seen = new Set();
+  feedCache = results
+    .filter((a) => (seen.has(a.link) ? false : seen.add(a.link)))
+    .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
+
+  lastUpdated = new Date().toISOString();
+  console.log(`[orion] feed aggiornato: ${feedCache.length} articoli @ ${lastUpdated}`);
+
+  await generateSummaries();
+  await checkAndNotify();
+}
+
+// ---------------------------------------------------------------------------
+// 3c. NOTIFICHE — controlla se tra le notizie nuove ce n'è qualcuna
+// "importante" (parole chiave) e, se sì, la manda in notifica a chi si è
+// iscritto. Tetto di 5 al giorno per non essere fastidiosi, poi si aspetta
+// il giorno dopo.
+// ---------------------------------------------------------------------------
+async function checkAndNotify() {
+  if (!pushEnabled) return;
+
+  // primo giro dopo un riavvio del server: la lista "già notificate" è vuota,
+  // quindi segniamo tutto quello che c'è già come "visto" SENZA notificare —
+  // altrimenti ogni riavvio manderebbe in un colpo solo tutte le notizie
+  // importanti già presenti nel feed, anche se non sono affatto nuove.
+  if (!hasRunNotifyCheck) {
+    feedCache.forEach((a) => { if (a.link) notifiedLinks.add(a.link); });
+    hasRunNotifyCheck = true;
+    console.log('[orion] primo controllo dopo il riavvio: nessuna notifica inviata, solo segnate come viste');
+    return;
+  }
+
+  if (!pushSubscriptions.length) return;
+
+  const today = new Date().toDateString();
+  if (today !== dailyNotifyResetDate) {
+    dailyNotifyCount = 0;
+    dailyNotifyResetDate = today;
+  }
+
+  const candidates = feedCache.filter((a) => a.link && !notifiedLinks.has(a.link) && isImportant(a.title));
+
+  for (const article of candidates) {
+    if (dailyNotifyCount >= MAX_NOTIFICATIONS_PER_DAY) break;
+
+    notifiedLinks.add(article.link);
+    dailyNotifyCount++;
+
+    const payload = JSON.stringify({
+      title: `Orion — ${CATEGORY_LABELS[article.category] || article.category}`,
+      body: article.title,
+      url: article.link,
+    });
+
+    // manda a tutti i dispositivi iscritti; se uno risulta scaduto/disinstallato, lo rimuoviamo
+    const stillValid = [];
+    for (const sub of pushSubscriptions) {
+      try {
+        await webpush.sendNotification(sub, payload);
+        stillValid.push(sub);
+      } catch (err) {
+        if (err.statusCode === 404 || err.statusCode === 410) {
+          console.log('[orion] iscrizione push scaduta, rimossa');
+        } else {
+          console.error('[orion] errore invio notifica:', err.message);
+          stillValid.push(sub); // errore temporaneo: la teniamo, riprovi al prossimo giro
+        }
+      }
+    }
+    pushSubscriptions = stillValid;
+  }
+
+  // teniamo solo gli ultimi 500 link notificati, per non far crescere la memoria all'infinito
+  if (notifiedLinks.size > 500) {
+    notifiedLinks = new Set([...notifiedLinks].slice(-500));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. ENDPOINT
+// ---------------------------------------------------------------------------
+app.get('/api/feed', (req, res) => {
+  const { category } = req.query;
+  const data = category ? feedCache.filter((a) => a.category === category) : feedCache;
+  res.json({ updatedAt: lastUpdated, count: data.length, articles: data, summaries: categorySummaries });
+});
+
+app.get('/api/summaries', (req, res) => {
+  res.json({ updatedAt: lastUpdated, summaries: categorySummaries });
+});
+
+app.get('/api/vapid-public-key', (req, res) => {
+  if (!pushEnabled) return res.status(503).json({ error: 'notifiche non configurate sul server' });
+  res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+app.post('/api/subscribe', (req, res) => {
+  if (!pushEnabled) return res.status(503).json({ error: 'notifiche non configurate sul server' });
+  const subscription = req.body;
+  if (!subscription || !subscription.endpoint) {
+    return res.status(400).json({ error: 'iscrizione non valida' });
+  }
+  // evita duplicati se lo stesso dispositivo si iscrive più volte
+  const alreadyThere = pushSubscriptions.some((s) => s.endpoint === subscription.endpoint);
+  if (!alreadyThere) pushSubscriptions.push(subscription);
+  res.json({ ok: true, totalSubscriptions: pushSubscriptions.length });
+});
+
+app.post('/api/unsubscribe', (req, res) => {
+  const { endpoint } = req.body || {};
+  pushSubscriptions = pushSubscriptions.filter((s) => s.endpoint !== endpoint);
+  res.json({ ok: true });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    cachedArticles: feedCache.length,
+    lastUpdated,
+    articoliPerFonte: lastCounts,
+    riassuntiIA: process.env.GROQ_API_KEY ? 'attivi' : 'disattivi (manca GROQ_API_KEY)',
+    notifichePush: pushEnabled ? `attive (${pushSubscriptions.length} dispositivi iscritti)` : 'disattive (mancano le chiavi VAPID)',
+    notificheOggi: `${dailyNotifyCount}/${MAX_NOTIFICATIONS_PER_DAY}`,
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5. AVVIO — fetch immediato + refresh periodico ogni 20 minuti
+// ---------------------------------------------------------------------------
+const REFRESH_MS = 20 * 60 * 1000;
+fetchAndUpdate();
+setInterval(fetchAndUpdate, REFRESH_MS);
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`[orion] server avviato sulla porta ${PORT}`));
