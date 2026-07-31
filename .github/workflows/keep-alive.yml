@@ -1,0 +1,20 @@
+# Manda un ping innocuo al backend ogni 10 minuti, così Render (piano
+# gratuito) non lo mette mai a dormire per inattività — niente più attese di
+# 10-20 secondi quando riapri Orion dopo qualche ora. Non tocca in nessun modo
+# server.js: è solo una richiesta esterna, esattamente come farebbe un utente
+# che apre l'app. Se un ping fallisce (es. il server si sta già svegliando da
+# solo), non facciamo fallire il flusso: è solo un tentativo in più tra 10 minuti.
+name: Tieni sveglio il backend Orion
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /api/health
+        run: |
+          curl -sS --max-time 40 https://orion-backend-vnbk.onrender.com/api/health -o /dev/null -w "Stato: %{http_code}\n" || echo "Ping non riuscito, riproviamo tra 10 minuti"
