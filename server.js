@@ -21,11 +21,15 @@ function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 // Se Groq risponde 429 (troppe richieste — capita anche perché il limite è
 // per ACCOUNT, non per chiave: se la stessa chiave la usa anche Clark nello
 // stesso momento, i conteggi si sommano), aspettiamo il tempo indicato da
-// Groq stesso (header Retry-After) e riproviamo una volta sola prima di
-// arrenderci, invece di fallire subito al primo intoppo.
+// Groq stesso (header Retry-After) e riproviamo fino a un totale di
+// GROQ_MAX_ATTEMPTS tentativi, invece di arrenderci al primo intoppo.
 // ---------------------------------------------------------------------------
+const GROQ_MAX_ATTEMPTS = 3; // prima erano 2 (1 solo riprovo): con la chiave condivisa con
+// Clark i 429 sono frequenti, un riprovo solo spesso non bastava e faceva sparire
+// del tutto flashcard/sentiment per quel ciclo invece di aspettare ancora un po'.
+
 async function callGroq(prompt, maxTokens, temperature = 0.3) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= GROQ_MAX_ATTEMPTS; attempt++) {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -40,9 +44,9 @@ async function callGroq(prompt, maxTokens, temperature = 0.3) {
       }),
     });
 
-    if (res.status === 429 && attempt === 1) {
-      const waitSeconds = Number(res.headers.get('retry-after')) || 8;
-      console.warn(`[orion] Groq 429 (troppe richieste), riprovo tra ${waitSeconds}s...`);
+    if (res.status === 429 && attempt < GROQ_MAX_ATTEMPTS) {
+      const waitSeconds = Number(res.headers.get('retry-after')) || 8 * attempt;
+      console.warn(`[orion] Groq 429 (troppe richieste), tentativo ${attempt}/${GROQ_MAX_ATTEMPTS}, riprovo tra ${waitSeconds}s...`);
       await sleep(waitSeconds * 1000);
       continue;
     }
@@ -51,7 +55,7 @@ async function callGroq(prompt, maxTokens, temperature = 0.3) {
     const data = await res.json();
     return data.choices?.[0]?.message?.content?.trim() || '';
   }
-  throw new Error('Groq status 429 (persistente dopo un tentativo di attesa)');
+  throw new Error('Groq status 429 (persistente dopo piu tentativi di attesa)');
 }
 
 // ---------------------------------------------------------------------------
@@ -476,16 +480,22 @@ async function generateWeeklySummaries() {
 
 // ---------------------------------------------------------------------------
 // 2d. BOLLINO DI SENTIMENT — per ogni notizia, chiediamo a Groq se il tono è
-// rialzista/ribassista/neutro. Una chiamata sola per categoria (non una per
-// articolo), per tenere basso il numero di chiamate a Groq.
+// rialzista/ribassista/neutro. A blocchi di più notizie per chiamata (non una
+// per articolo), per tenere basso il numero di chiamate a Groq.
 // Se Groq risponde in un formato inatteso o con un'etichetta non valida,
 // quella notizia resta senza bollino invece di mostrare qualcosa di sbagliato.
 // ---------------------------------------------------------------------------
 const VALID_SENTIMENTS = ['rialzista', 'ribassista', 'neutro'];
 
-async function classifySentiment(articles) {
-  if (!articles.length) return;
-  const batch = articles.slice(0, 10);
+// PRIMA c'era un "articles.slice(0, 10)" qui: classificava SOLO le 10 notizie
+// più recenti di ogni categoria e le altre restavano per sempre senza bollino
+// (non era un problema di Groq: il codice non le chiedeva proprio). Ora
+// classifichiamo TUTTE le notizie della categoria, a blocchi da 15 alla volta
+// (un blocco = una chiamata a Groq), con una piccola pausa tra un blocco e
+// l'altro, così anche le categorie con tante notizie vengono coperte per intero.
+const SENTIMENT_BATCH_SIZE = 15;
+
+async function classifySentimentBatch(batch) {
   const list = batch.map((a, i) => `${i}: ${a.title}`).join('\n');
 
   const prompt = `Classifica il tono di ciascuna di queste notizie finanziarie come "rialzista"
@@ -498,7 +508,7 @@ Notizie:
 ${list}`;
 
   try {
-    const raw = await callGroq(prompt, 400, 0.1);
+    const raw = await callGroq(prompt, 700, 0.1);
 
     // il modello a volte aggiunge testo attorno al JSON nonostante l'istruzione:
     // isoliamo solo la parte tra la prima [ e l'ultima ] prima di provare a leggerlo
@@ -516,16 +526,32 @@ ${list}`;
       }
     }
   } catch (err) {
-    console.warn('[orion] classificazione sentiment fallita per questo gruppo:', err.message);
-    // nessun sentiment assegnato per questo gruppo: le notizie restano semplicemente senza bollino
+    console.warn('[orion] classificazione sentiment fallita per questo blocco:', err.message);
+    // nessun sentiment assegnato per questo blocco: le notizie restano semplicemente senza bollino
   }
 }
+
+async function classifySentiment(articles) {
+  if (!articles.length) return;
+  for (let start = 0; start < articles.length; start += SENTIMENT_BATCH_SIZE) {
+    const batch = articles.slice(start, start + SENTIMENT_BATCH_SIZE);
+    await classifySentimentBatch(batch);
+    if (start + SENTIMENT_BATCH_SIZE < articles.length) await sleep(2000);
+  }
+}
+
+let categorySentimentStatus = {}; // diagnostica: copertura sentiment per categoria, vedi /api/health
 
 async function generateSentiments() {
   if (!process.env.GROQ_API_KEY) return;
   for (const cat of Object.keys(CATEGORY_LABELS)) {
     const articles = feedCache.filter((a) => a.category === cat && !a.sentiment);
     await classifySentiment(articles);
+
+    const total = feedCache.filter((a) => a.category === cat).length;
+    const classified = feedCache.filter((a) => a.category === cat && a.sentiment).length;
+    categorySentimentStatus[cat] = total ? `${classified}/${total} classificate` : 'nessuna notizia disponibile per questa categoria';
+
     await sleep(5000);
   }
   console.log('[orion] sentiment assegnato a', feedCache.filter((a) => a.sentiment).length, '/', feedCache.length, 'notizie');
@@ -700,6 +726,7 @@ app.get('/api/health', (req, res) => {
     riassuntiIA: process.env.GROQ_API_KEY ? 'attivi' : 'disattivi (manca GROQ_API_KEY)',
     dettaglioRiassuntiPerCategoria: categorySummaryStatus,
     sentiment: `${feedCache.filter((a) => a.sentiment).length}/${feedCache.length} notizie classificate`,
+    dettaglioSentimentPerCategoria: categorySentimentStatus,
     archivioSettimanale: Object.fromEntries(Object.entries(dailyArchive).map(([k, v]) => [k, `${v.length} giorni`])),
     notifichePush: pushEnabled ? `attive (${pushSubscriptions.length} dispositivi iscritti)` : 'disattive (mancano le chiavi VAPID)',
     notificheOggi: `${dailyNotifyCount}/${MAX_NOTIFICATIONS_PER_DAY}`,
